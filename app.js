@@ -5,6 +5,7 @@ const STORAGE_KEY = 'hausverstand-wien-v3';
 const V2_KEY = 'hausverstand-wien-v2';
 const V1_KEY = 'hausverstand-wien-v1';
 const SETTINGS_KEY = 'hausverstand-settings';
+const REVIEW_KEY = 'hausverstand-review';
 const REVIEW_ROUND = 5;
 // Abstand in Tagen bis zur nächsten Wiederholung je Stufe (0 = heute).
 const INTERVALS = [0, 1, 3, 7, 16, 35];
@@ -27,7 +28,8 @@ const dayString = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.ge
 const today = () => dayString(new Date());
 const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return dayString(d); };
 const isDay = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
-const fresh = () => ({version: 3, progress: {}, last: null, contentRev: null});
+const fresh = () => ({version: 3, progress: {}, last: null, contentRev: null, resetAt: 0});
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
 let appState = fresh(), storageOK = true, notices = [], view = {kind: 'home'}, exercise = null, result = null;
 let review = {ids: [], done: 0}, wordLimit = 6, previousFocus = null, settings = {font: 0};
@@ -46,7 +48,8 @@ function cleanEntry(p) {
   const needsReview = p.needsReview === true;
   const box = Number.isInteger(p.box) ? Math.max(0, Math.min(INTERVALS.length - 1, p.box)) : (correct === true ? 1 : 0);
   const due = isDay(p.due) ? p.due : needsReview ? today() : seen ? addDays(2) : null;
-  return {seen, correct, needsReview, box, due};
+  const at = Number.isFinite(p.at) && p.at > 0 ? p.at : 0;
+  return {seen, correct, needsReview, box, due, at};
 }
 function adoptProgress(progress) {
   const out = {};
@@ -54,20 +57,50 @@ function adoptProgress(progress) {
     for (const [id, p] of Object.entries(progress)) {
       if (!unitById.has(id)) continue;
       const entry = cleanEntry(p);
-      if (entry) out[id] = entry;
+      if (entry && entry.seen) out[id] = entry;
     }
   }
   return out;
 }
+// Zusammenführen, falls die Seite in mehreren Tabs offen ist oder ein Lernstand importiert wird:
+// je Aufgabe gewinnt der zuletzt gespeicherte Eintrag; ein Zurücksetzen gilt für alle älteren Einträge.
+function newerEntry(x, y) {
+  if (!x) return y;
+  if (!y) return x;
+  return x.at > y.at ? x : y;
+}
+function readV3() {
+  const v3 = readJSON(STORAGE_KEY);
+  if (!v3 || v3.version !== 3) return null;
+  return {version: 3, progress: adoptProgress(v3.progress), last: cleanCursor(v3.last), contentRev: typeof v3.contentRev === 'string' ? v3.contentRev : null, resetAt: Number.isFinite(v3.resetAt) ? v3.resetAt : 0};
+}
+function mergeStates(other, mine) {
+  const resetAt = Math.max(other.resetAt || 0, mine.resetAt || 0);
+  const progress = {};
+  for (const source of [other.progress, mine.progress]) {
+    for (const [id, e] of Object.entries(source)) {
+      if (resetAt && e.at < resetAt) continue;
+      progress[id] = newerEntry(progress[id], e);
+    }
+  }
+  return {...mine, progress, resetAt};
+}
 function loadState() {
   try {
-    const v3 = readJSON(STORAGE_KEY);
-    if (v3 && v3.version === 3) {
-      appState = {version: 3, progress: adoptProgress(v3.progress), last: cleanCursor(v3.last), contentRev: typeof v3.contentRev === 'string' ? v3.contentRev : null};
+    const v3 = readV3();
+    if (v3) {
+      appState = v3;
+      // Ein noch offenes Fenster der alten Version speichert weiter im alten Format: fehlende Einträge nachholen.
+      const v2 = readJSON(V2_KEY);
+      if (!appState.resetAt && v2 && v2.version === 2) {
+        let added = 0;
+        for (const [id, e] of Object.entries(adoptProgress(v2.progress))) if (!has(appState.progress, id)) { appState.progress[id] = e; added++; }
+        if (added) notices.push(`${added} ${added === 1 ? 'Aufgabe' : 'Aufgaben'} aus einem älteren Fenster übernommen.`);
+      }
     } else {
       const v2 = readJSON(V2_KEY);
       if (v2 && v2.version === 2 && v2.progress && typeof v2.progress === 'object') {
-        appState = {version: 3, progress: adoptProgress(v2.progress), last: cleanCursor(v2.last), contentRev: null};
+        appState = {...fresh(), progress: adoptProgress(v2.progress), last: cleanCursor(v2.last)};
       } else {
         const v1 = readJSON(V1_KEY);
         if (v1 && typeof v1 === 'object') {
@@ -76,7 +109,7 @@ function loadState() {
             const c = moduleById.get(V1_MODULES[i]);
             for (let j = 0; j < 3; j++) {
               const seen = completed.includes(i) || (v1.passed && v1.passed[`${i}:${j}`] === true);
-              if (seen) appState.progress[c.steps[j].id] = {seen: true, correct: null, needsReview: false, box: 0, due: addDays(2)};
+              if (seen) appState.progress[c.steps[j].id] = {seen: true, correct: null, needsReview: false, box: 0, due: addDays(2), at: 0};
             }
           }
           if (Number.isInteger(v1.chapter) && v1.chapter >= 0 && v1.chapter < 16 && Number.isInteger(v1.step) && v1.step >= 0 && v1.step < 3) {
@@ -91,14 +124,29 @@ function loadState() {
       let flagged = 0;
       for (const {u} of allUnits) {
         const p = appState.progress[u.id];
-        if (u.updated && p && p.seen) { p.needsReview = true; p.due = today(); flagged++; }
+        if (u.updated && p && p.seen) { p.needsReview = true; p.due = today(); p.at = Date.now(); flagged++; }
       }
       if (!isNew && flagged) notices.push(`${flagged} ${flagged === 1 ? 'Aufgabe wurde' : 'Aufgaben wurden'} fachlich aktualisiert und ${flagged === 1 ? 'liegt' : 'liegen'} zum Wiederholen bereit.`);
       appState.contentRev = CONTENT_REV;
     }
   } catch (e) { storageOK = false; }
 }
-function persist() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appState)); storageOK = true; } catch (e) { storageOK = false; } }
+function persist() {
+  try {
+    const stored = readV3();
+    if (stored) appState = mergeStates(stored, appState);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+    storageOK = true;
+  } catch (e) { storageOK = false; }
+}
+function saveReview() { try { sessionStorage.setItem(REVIEW_KEY, JSON.stringify(review)); } catch (e) { /* nur diese Seite */ } }
+function loadReview() {
+  try {
+    const r = JSON.parse(sessionStorage.getItem(REVIEW_KEY) || 'null');
+    if (r && Array.isArray(r.ids) && r.ids.every(id => unitById.has(id)) && Number.isInteger(r.done)) return {ids: r.ids, done: r.done};
+  } catch (e) { /* ignorieren */ }
+  return null;
+}
 function loadSettings() { const s = readJSON(SETTINGS_KEY); settings.font = s && [0, 1, 2].includes(s.font) ? s.font : 0; applySettings(); }
 function applySettings() { document.documentElement.dataset.font = String(settings.font); }
 function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* nur diese Sitzung */ } }
@@ -138,7 +186,7 @@ function record(u, correct, inReview) {
     const box = Math.max(prev?.box || 0, 1);
     entry = {needsReview: false, box, due: addDays(INTERVALS[box])};
   }
-  appState.progress[u.id] = {seen: true, correct, ...entry};
+  appState.progress[u.id] = {seen: true, correct, ...entry, at: Date.now()};
   persist();
 }
 
@@ -187,7 +235,7 @@ function announce(text) { const el = $('live'); el.textContent = ''; window.setT
 /* ───────── Navigation ───────── */
 function hashFor(v) {
   if (v.kind === 'category') return `#category/${v.category}/${v.page || 0}`;
-  if (v.kind === 'learn') return `#learn/${v.moduleId}/${v.index}/${v.stage}`;
+  if (v.kind === 'learn') return `#${v.review ? 'review' : 'learn'}/${v.moduleId}/${v.index}/${v.stage}`;
   if (v.kind === 'finish') return `#done/${v.moduleId}`;
   if (v.kind === 'review-end') return '#review';
   if (v.kind === 'path') return '#path';
@@ -196,10 +244,15 @@ function hashFor(v) {
 function parseHash() {
   const a = location.hash.slice(1).split('/');
   if (a[0] === 'category' && CATEGORIES.some(c => c.id === a[1])) return {kind: 'category', category: a[1], page: Number(a[2]) || 0};
-  if (a[0] === 'learn' && moduleById.has(a[1])) {
+  if ((a[0] === 'learn' || a[0] === 'review') && moduleById.has(a[1])) {
     const cur = cleanCursor({moduleId: a[1], index: Number(a[2]), stage: a[3]});
+    if (cur && a[0] === 'review') {
+      const r = loadReview();
+      if (r && r.ids[r.done] === `${cur.moduleId}:${cur.index}`) { review = r; return {kind: 'learn', ...cur, stage: 'quiz', review: true}; }
+    }
     if (cur) return {kind: 'learn', ...cur};
   }
+  if (a[0] === 'review') return {kind: 'review-end'};
   if (a[0] === 'done' && moduleById.has(a[1]) && moduleComplete(moduleById.get(a[1]))) return {kind: 'finish', moduleId: a[1]};
   if (a[0] === 'path') return {kind: 'path'};
   return {kind: 'home'};
@@ -232,6 +285,7 @@ function startModule(id, index, stage = 'learn', inReview = false) {
 function startReview() {
   const queue = dueUnits().slice(0, REVIEW_ROUND);
   review = {ids: queue.map(x => x.u.id), done: 0};
+  saveReview();
   if (!queue.length) { navigate({kind: 'review-end'}); return; }
   startModule(queue[0].c.id, queue[0].index, 'quiz', true);
 }
@@ -343,10 +397,15 @@ function submitAnswer(n) {
     result = {correct, selected: [...exercise.selected]};
   }
   record(u, correct, view.review);
+  if (!view.review) {
+    const c = moduleById.get(view.moduleId);
+    appState.last = view.index + 1 < c.steps.length ? {moduleId: c.id, index: view.index + 1, stage: 'learn'} : null;
+    persist();
+  }
   navigate({...view, stage: 'feedback'}, true);
 }
 function parseAmount(text) {
-  const raw = String(text).trim().replace(/[\s€%]/g, '');
+  const raw = String(text).trim().replace(/[\u2212\u2013]/g, '-').replace(/[\s€%]/g, '').replace(/,-+$/, '');
   if (/^-?\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?$/.test(raw)) return Number(raw.replace(/\./g, '').replace(',', '.'));
   if (/^-?\d+(?:,\d{1,2})?$/.test(raw)) return Number(raw.replace(',', '.'));
   if (/^-?\d+(?:\.\d{1,2})?$/.test(raw)) return Number(raw);
@@ -367,13 +426,13 @@ function feedbackHTML(u) {
   if (u.kind === 'order') {
     const rows = u.items.map((t, i) => {
       const at = result.picked.indexOf(i);
-      return `<li class="${at === i ? 'hit' : 'miss-row'}">${esc(t)}${at === i ? '<span class="mark" aria-label="richtig platziert"> ✓</span>' : `<span class="mark"> – bei dir Schritt ${at + 1}</span>`}</li>`;
+      return `<li class="${at === i ? 'hit' : 'miss-row'}">${esc(t)}${at === i ? '<span class="mark"><span aria-hidden="true"> ✓</span><span class="sr-only"> richtig platziert</span></span>' : `<span class="mark"> – bei dir Schritt ${at + 1}</span>`}</li>`;
     }).join('');
     return `<div class="answer-result ${result.correct ? '' : 'retry'}"><div class="result-label">${result.correct ? '<span aria-hidden="true">✓</span>Deine Reihenfolge passt' : 'Sinnvolle Reihenfolge'}</div><ol class="solution-list">${rows}</ol></div>`;
   }
   const rows = u.pairs.map(([term, meaning], i) => {
     const hit = result.selected[i] === i;
-    return `<li class="${hit ? 'hit' : 'miss-row'}"><strong>${esc(term)}</strong>: ${esc(meaning)}${hit ? '<span class="mark" aria-label="richtig"> ✓</span>' : `<span class="mark"> – bei dir: ${esc(u.pairs[result.selected[i]][1])}</span>`}</li>`;
+    return `<li class="${hit ? 'hit' : 'miss-row'}"><strong>${esc(term)}</strong>: ${esc(meaning)}${hit ? '<span class="mark"><span aria-hidden="true"> ✓</span><span class="sr-only"> richtig</span></span>' : `<span class="mark"> – bei dir: ${esc(u.pairs[result.selected[i]][1])}</span>`}</li>`;
   }).join('');
   return `<div class="answer-result ${result.correct ? '' : 'retry'}"><div class="result-label">${result.correct ? '<span aria-hidden="true">✓</span>Deine Zuordnung passt' : 'So gehört es zusammen'}</div><ul class="solution-list">${rows}</ul></div>`;
 }
@@ -402,7 +461,7 @@ function renderCategory() {
 function renderLesson() {
   const c = moduleById.get(view.moduleId), u = c.steps[view.index], cat = CATEGORIES.find(k => k.id === c.category);
   if (view.stage === 'feedback' && !result) view.stage = 'quiz';
-  if (!view.review) { appState.last = {moduleId: c.id, index: view.index, stage: view.stage === 'feedback' ? 'quiz' : view.stage}; persist(); }
+  if (!view.review && view.stage !== 'feedback') { appState.last = {moduleId: c.id, index: view.index, stage: view.stage}; persist(); }
   ensureExercise(u);
   const stageIndex = ['learn', 'quiz', 'feedback'].indexOf(view.stage);
   const context = view.review ? `Wiederholung ${review.done + 1} von ${review.ids.length}` : `Aufgabe ${view.index + 1} von ${c.steps.length}`;
@@ -430,7 +489,7 @@ function renderFinish() {
 }
 function renderReviewEnd() {
   const pending = dueUnits().length;
-  $('main').innerHTML = `<section class="review-empty"><div class="finish-marker" aria-hidden="true">${review.done ? '✓' : '↻'}</div><div class="eyebrow">WIEDERHOLEN</div><h1>${review.done ? 'Runde geschafft.' : 'Gerade nichts fällig.'}</h1><p>${pending ? `${pending} ${pending === 1 ? 'Aufgabe ist' : 'Aufgaben sind'} noch fällig. Eine weitere Runde hat höchstens ${REVIEW_ROUND} Aufgaben.` : 'Hier erscheinen falsch beantwortete Aufgaben und Gelerntes, das nach ein paar Tagen wieder dran ist.'}</p><button type="button" class="primary" data-action="home">Zum Lernweg</button>${pending ? '<br><button type="button" class="link-button" data-action="review">Noch eine Runde</button>' : ''}</section>`;
+  $('main').innerHTML = `<section class="review-empty"><div class="finish-marker" aria-hidden="true">${review.done ? '✓' : '↻'}</div><div class="eyebrow">WIEDERHOLEN</div><h1>${review.done ? 'Runde geschafft.' : pending ? 'Bereit zum Wiederholen.' : 'Gerade nichts fällig.'}</h1><p>${pending ? `${pending} ${pending === 1 ? 'Aufgabe ist' : 'Aufgaben sind'} noch fällig. Eine weitere Runde hat höchstens ${REVIEW_ROUND} Aufgaben.` : 'Hier erscheinen falsch beantwortete Aufgaben und Gelerntes, das nach ein paar Tagen wieder dran ist.'}</p><button type="button" class="primary" data-action="home">Zum Lernweg</button>${pending ? `<br><button type="button" class="link-button" data-action="review">${review.done ? 'Noch eine Runde' : 'Runde starten'}</button>` : ''}</section>`;
 }
 function renderPath() {
   $('main').innerHTML = `<div class="crumb"><button type="button" class="back" data-action="home">‹ Lernweg</button></div><div class="eyebrow">ORIENTIERUNG</div><h1>Dein Weg in drei Phasen</h1><p class="intro-text">Ein Vorschlag, keine Vorgabe. Tempo und Reihenfolge bestimmst du – die Phasen dürfen sich überlappen.</p>
@@ -453,6 +512,7 @@ function nextStep() {
   exercise = null; result = null;
   if (view.review) {
     review.done++;
+    saveReview();
     const nextId = review.ids[review.done];
     if (!nextId) { navigate({kind: 'review-end'}, true); return; }
     const x = unitById.get(nextId);
@@ -474,11 +534,15 @@ function openDialog(title, html) {
   if (!alreadyOpen) previousFocus = document.activeElement;
   $('dialog-title').textContent = title;
   $('dialog-content').innerHTML = html;
-  if (!alreadyOpen) d.showModal();
+  if (!alreadyOpen) { if (typeof d.showModal === 'function') d.showModal(); else { d.setAttribute('open', ''); $('dialog-title').focus(); } }
   else $('dialog-title').focus();
 }
-function closeDialog() { $('dialog').close(); }
-function showWord(word) { if (!Object.hasOwn(TERMS, word)) return; openDialog(word, `<p>${esc(TERMS[word])}</p><button type="button" class="link-button" data-modal="words">Alle Wörter ansehen</button>`); }
+function closeDialog() {
+  const d = $('dialog');
+  if (typeof d.close === 'function') d.close();
+  else if (d.hasAttribute('open')) { d.removeAttribute('open'); d.dispatchEvent(new Event('close')); }
+}
+function showWord(word) { if (!has(TERMS, word)) return; openDialog(word, `<p>${esc(TERMS[word])}</p><button type="button" class="link-button" data-modal="words">Alle Wörter ansehen</button>`); }
 function showWords() {
   wordLimit = 6;
   openDialog('Wörter einfach erklärt', '<label class="field-label" for="word-search">Welches Wort suchst du?</label><input class="search-input" type="search" id="word-search" placeholder="Zum Beispiel Rücklage" autocomplete="off"><div id="word-results" aria-live="polite"></div>');
@@ -496,17 +560,17 @@ function renderWords() {
 function sourceLink(id, label) { const s = SOURCES[id]; return `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(label || s.title)}<span class="sr-only"> (öffnet einen neuen Tab)</span></a>`; }
 function showCourses() {
   openDialog('Kurse & Förderung', `<p class="small muted">Für Inhalte, Termine, Preise und Voraussetzungen zählt das aktuelle Angebot des Anbieters. Geprüft am ${CHECKED}.</p>
-  <article class="course-resource"><span class="phase-tag">Phase 1 · begleitet mitarbeiten</span><h3>Immobilienverwaltungsassistenz</h3><p>Grundlagen für die Mitarbeit: MRG, WEG, Abrechnung, Alltag. Danach ist eine Personenzertifizierung möglich. <strong>Keine Gewerbeberechtigung.</strong></p><p>${sourceLink('wifi', 'WIFI Wien')} · ${sourceLink('bfi', 'BFI Wien')} · ${sourceLink('ovi', 'ÖVI Immobilienakademie')}</p></article>
-  <article class="course-resource"><span class="phase-tag">Phase 2 · eigenständig bearbeiten</span><h3>Vorbereitung auf die Befähigungsprüfung</h3><p>Prüfung bei der Meisterprüfungsstelle der WK Wien, vier Module, Antritt ab 18. <span class="basis basis-anbieter">Anbieter</span> Das WIFI empfiehlt für den Lehrgang 1–2 Jahre Branchenerfahrung.</p><p>${sourceLink('exam', 'WIFI Wien')} · ${sourceLink('oviexam', 'ÖVI Immobilienakademie')} · ${sourceLink('wko', 'WKO-Infos zum Befähigungsnachweis')}</p></article>
+  <article class="course-resource"><span class="phase-tag">Phase 1 · begleitet mitarbeiten</span><h3>Assistenz in der Immobilienverwaltung</h3><p>Grundlagen für die Mitarbeit: MRG, WEG, Abrechnung, Alltag. Danach ist eine Personenzertifizierung möglich. <strong>Keine Gewerbeberechtigung.</strong></p><p>${sourceLink('wifi', 'WIFI Wien')} · ${sourceLink('bfi', 'BFI Wien')} · ${sourceLink('ovi', 'ÖVI Immobilienakademie')}</p></article>
+  <article class="course-resource"><span class="phase-tag">Phase 2 · eigenständig bearbeiten</span><h3>Vorbereitung auf die Befähigungsprüfung</h3><p>Prüfung bei der Meisterprüfungsstelle der WK Wien, vier Module, Antritt ab 18. Für den Gewerbezugang kommt in der Regel Verwalterpraxis dazu – wie viel, hängt von der Schulbildung ab. <span class="basis basis-anbieter">Anbieter</span> Das WIFI empfiehlt für den Lehrgang 1–2 Jahre Branchenerfahrung.</p><p>${sourceLink('exam', 'WIFI Wien')} · ${sourceLink('oviexam', 'ÖVI Immobilienakademie')} · ${sourceLink('wko', 'WKO-Infos zum Befähigungsnachweis')}</p></article>
   <article class="course-resource"><span class="phase-tag">Phase 3 · Verantwortung übernehmen</span><h3>Nachfolge &amp; Unternehmensführung</h3><p>Beratung zu Übergabe, Bewertung, Gewerberecht und Begünstigungen.</p><p>${sourceLink('nachfolge', 'WK Wien: Generationenwechsel')} · ${sourceLink('neufoeg', 'NeuFöG für Übernehmer')}</p></article>
-  <article class="course-resource"><h3>Förderung – nur im Einzelfall</h3><ul class="plain-list"><li><strong>Beschäftigt:</strong> AMS-Weiterbildungszeit (Vereinbarung mit dem Arbeitgeber nötig, strengere Regeln mit Studienabschluss), waff-Bildungskonto (Einkommensgrenze), AK-Bildungsgutschein.</li><li><strong>Arbeitsuchend:</strong> AMS-Kursförderung, Unternehmensgründungsprogramm.</li><li>Kein Rechtsanspruch. Immer <strong>vor</strong> der Buchung klären.</li></ul><p>${sourceLink('amswbz', 'AMS Weiterbildungszeit')} · ${sourceLink('waff', 'waff')} · ${sourceLink('ak', 'AK Wien')} · ${sourceLink('ugp', 'AMS-Gründungsprogramm')}</p></article>`);
+  <article class="course-resource"><h3>Förderung – nur im Einzelfall</h3><ul class="plain-list"><li><strong>Beschäftigt:</strong> AMS-Weiterbildungszeit (Vereinbarung mit dem Arbeitgeber nötig, strengere Regeln mit Master- oder Diplomabschluss), waff-Förderungen (je nach Programm, teils mit Einkommensgrenze), AK-Bildungsgutschein.</li><li><strong>Arbeitsuchend:</strong> AMS-Kursförderung, Unternehmensgründungsprogramm.</li><li>Kein Rechtsanspruch. Immer <strong>vor</strong> der Buchung klären.</li></ul><p>${sourceLink('amswbz', 'AMS Weiterbildungszeit')} · ${sourceLink('waff', 'waff')} · ${sourceLink('ak', 'AK Wien')} · ${sourceLink('ugp', 'AMS-Gründungsprogramm')}</p></article>`);
 }
 function showSources() {
   const groups = Object.keys(BASIS).map(type => {
     const items = Object.values(SOURCES).filter(s => s.type === type);
     return items.length ? `<h3>${esc(BASIS[type])}</h3><ul class="source-list">${items.map(s => `<li><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}<span class="sr-only"> (öffnet einen neuen Tab)</span></a></li>`).join('')}</ul>` : '';
   }).join('');
-  openDialog('Quellen & Hinweise', `<p class="small muted">Lernhilfe für Österreich mit Schwerpunkt Wien. Vereinfachte Übungsfälle ersetzen keine Rechts-, Steuer- oder Förderberatung. Zahlen in Beispielen sind erfunden, außer sie sind als Rechtsregel gekennzeichnet.</p><p class="small"><span class="basis basis-gesetz">Gesetz</span> bindende Regel · <span class="basis basis-behoerde">Behörde</span> Auskunft oder Richtlinie einer Stelle · <span class="basis basis-anbieter">Anbieter</span> Empfehlung eines Kursanbieters · <span class="basis basis-orientierung">Orientierung</span> Vorschlag für deinen Weg</p>${groups}<p class="small muted">Stand der fachlichen Prüfung: ${CHECKED}. Quellen werden nicht automatisch aktualisiert.</p>`);
+  openDialog('Quellen & Hinweise', `<p class="small muted">Lernhilfe für Österreich mit Schwerpunkt Wien. Vereinfachte Übungsfälle ersetzen keine Rechts-, Steuer- oder Förderberatung. Zahlen in Beispielen sind erfunden, außer sie sind als Rechtsregel gekennzeichnet.</p><p class="small"><span class="basis basis-gesetz">Gesetz</span> bindende Regel · <span class="basis basis-behoerde">Kammer / Behörde</span> allgemeine Auskunft oder Förderrichtlinie, keine verbindliche Einzelfallauskunft · <span class="basis basis-anbieter">Anbieter</span> Empfehlung eines Kursanbieters · <span class="basis basis-orientierung">Orientierung</span> Vorschlag für deinen Weg</p>${groups}<p class="small muted">Stand der fachlichen Prüfung: ${CHECKED}. Quellen werden nicht automatisch aktualisiert.</p>`);
 }
 function showProgress() {
   const progress = Object.values(appState.progress);
@@ -541,13 +605,17 @@ function importProgress(file) {
     if (!data || ![2, 3].includes(data.version) || !data.progress || typeof data.progress !== 'object') { status.textContent = 'Das ist keine gültige Lernstand-Datei.'; return; }
     const progress = adoptProgress(data.progress);
     if (!Object.keys(progress).length) { status.textContent = 'In der Datei ist kein passender Lernstand enthalten.'; return; }
-    appState = {version: 3, progress, last: cleanCursor(data.last), contentRev: data.version === 3 && typeof data.contentRev === 'string' ? data.contentRev : null};
-    if (appState.contentRev !== CONTENT_REV) {
-      for (const {u} of allUnits) { const p = appState.progress[u.id]; if (u.updated && p && p.seen) { p.needsReview = true; p.due = today(); } }
-      appState.contentRev = CONTENT_REV;
+    const importedRev = data.version === 3 && typeof data.contentRev === 'string' ? data.contentRev : null;
+    if (importedRev !== CONTENT_REV) {
+      for (const {u} of allUnits) { const p = progress[u.id]; if (u.updated && p) { p.needsReview = true; p.due = today(); } }
     }
+    // Nichts überschreiben: je Aufgabe gewinnt der neuere Eintrag. Nach einem Zurücksetzen zählt der Import als neu.
+    for (const e of Object.values(progress)) if (e.at < appState.resetAt) e.at = appState.resetAt;
+    appState = mergeStates({progress, resetAt: 0}, appState);
+    if (!appState.last) appState.last = cleanCursor(data.last);
     persist();
-    status.textContent = `Lernstand geladen: ${Object.keys(progress).length} Aufgaben.`;
+    if (view.kind !== 'learn') render();
+    status.textContent = `Lernstand zusammengeführt: ${Object.keys(progress).length} Aufgaben aus der Datei.`;
   }).catch(() => { status.textContent = 'Die Datei konnte nicht gelesen werden.'; });
 }
 
@@ -596,12 +664,12 @@ $('dialog-content').addEventListener('click', e => {
     settings.font = Number(b.dataset.font); applySettings(); saveSettings();
     $('dialog-content').querySelectorAll('[data-modal="font"]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   } else if (a === 'confirm-reset') {
-    appState = fresh(); appState.contentRev = CONTENT_REV; exercise = null; result = null; review = {ids: [], done: 0};
-    try { localStorage.removeItem(V1_KEY); localStorage.removeItem(V2_KEY); } catch (err) { storageOK = false; }
-    persist(); closeDialog(); navigate({kind: 'home'});
-  } else if (a === 'home') { closeDialog(); exercise = null; result = null; navigate({kind: 'home'}); }
-  else if (a === 'path') { closeDialog(); navigate({kind: 'path'}); }
-  else if (a === 'review') { closeDialog(); startReview(); }
+    appState = fresh(); appState.contentRev = CONTENT_REV; appState.resetAt = Date.now(); exercise = null; result = null; review = {ids: [], done: 0};
+    try { localStorage.removeItem(V1_KEY); localStorage.removeItem(V2_KEY); localStorage.removeItem(STORAGE_KEY); sessionStorage.removeItem(REVIEW_KEY); } catch (err) { storageOK = false; }
+    persist(); previousFocus = null; closeDialog(); navigate({kind: 'home'});
+  } else if (a === 'home') { previousFocus = null; closeDialog(); exercise = null; result = null; navigate({kind: 'home'}); }
+  else if (a === 'path') { previousFocus = null; closeDialog(); navigate({kind: 'path'}); }
+  else if (a === 'review') { previousFocus = null; closeDialog(); startReview(); }
 });
 $('brand').addEventListener('click', e => { e.preventDefault(); exercise = null; result = null; navigate({kind: 'home'}); });
 $('words').addEventListener('click', showWords);
@@ -613,7 +681,21 @@ $('dialog').addEventListener('click', e => {
   const r = e.target.getBoundingClientRect();
   if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) closeDialog();
 });
-window.addEventListener('popstate', () => { view = parseHash(); exercise = null; result = null; render(); focusMain(); });
+window.addEventListener('popstate', () => {
+  if (location.hash === '#main') return;
+  if ($('dialog').open) { previousFocus = null; closeDialog(); }
+  view = parseHash(); exercise = null; result = null; render(); focusMain();
+});
+document.querySelector('.skip').addEventListener('click', e => { e.preventDefault(); $('main').focus(); });
+// Lernstand aus einem anderen Tab übernehmen, damit nichts überschrieben wird.
+window.addEventListener('storage', e => {
+  if (e.key === SETTINGS_KEY) { loadSettings(); return; }
+  if (e.key !== STORAGE_KEY || !e.newValue) return;
+  const other = readV3();
+  if (!other) return;
+  appState = mergeStates(other, appState);
+  if (view.kind !== 'learn') render();
+});
 
 loadSettings();
 loadState();

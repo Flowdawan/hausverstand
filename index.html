@@ -7,7 +7,7 @@
 <title>Hausverstand · Schritt für Schritt lernen</title>
 <meta name="description" content="Hausverwaltung in Wien verstehen. Kleine Aufgaben zu Grundlagen, Mitarbeit, Kursvorbereitung und Übernahme eines Familienbetriebs.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23254eff'/%3E%3Cpath d='M7 15L16 7l9 8v11H7z' fill='white'/%3E%3Cpath d='M14 19h5v7h-5z' fill='%23254eff'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="styles.css?v=2026-10-05">
+<link rel="stylesheet" href="styles.css?v=2026-10-05b">
 <script>
   // Gespeicherte Schriftgröße vor dem ersten Zeichnen setzen, damit nichts springt.
   try { var hvs = JSON.parse(localStorage.getItem('hausverstand-settings') || '{}'); if ([1, 2].indexOf(hvs.font) >= 0) document.documentElement.dataset.font = String(hvs.font); } catch (e) {}
@@ -19,14 +19,14 @@
   <a href="#home" class="brand" id="brand"><span class="brandmark" aria-hidden="true">H.</span><span>hausverstand<small>WIEN</small></span></a>
   <nav aria-label="Hilfen"><button type="button" class="quiet" id="words">Wörter</button><button type="button" class="menu-button" id="menu">Menü</button></nav>
 </header>
-<main id="main" tabindex="-1"><noscript><p>Diese Lernseite braucht JavaScript.</p></noscript></main>
+<main id="main" tabindex="-1"><p class="intro-text">Die Lernseite wird geladen … Falls hier nichts erscheint, ist JavaScript ausgeschaltet oder der Browser zu alt. Bitte aktualisiere ihn oder nutze einen aktuellen Browser.</p></main>
 <footer id="footer">Dein Tempo. Ein Schritt nach dem anderen.</footer>
 <p id="live" class="sr-only" aria-live="polite"></p>
 <dialog id="dialog" aria-labelledby="dialog-title">
   <div class="dialog-head"><h2 id="dialog-title" tabindex="-1"></h2><button type="button" class="quiet" id="close-dialog">Schließen</button></div>
   <div id="dialog-content"></div>
 </dialog>
-<script src="content.js?v=2026-10-05"></script>
-<script src="app.js?v=2026-10-05"></script>
+<script src="content.js?v=2026-10-05b"></script>
+<script src="app.js?v=2026-10-05b"></script>
 </body>
 </html>

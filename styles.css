@@ -1314,9 +1314,11 @@ html[data-font="2"] {
 }
 .category-card .card-title,
 .module-card .card-title,
-.learning-body h1 {
+h1,
+#dialog-content h3,
+.dialog-head h2 {
   hyphens: auto;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
 }
 .category-meta {
   margin-top: auto;
@@ -1619,4 +1621,32 @@ dialog h3 {
 }
 .dialog-head button {
   margin-left: auto;
+}
+.source-mini,
+.source-list {
+  grid-template-columns: minmax(0, 1fr);
+}
+.source-mini a,
+.source-list a,
+.course-resource a {
+  overflow-wrap: anywhere;
+}
+.detail .source-mini a,
+.source-list a {
+  display: inline-block;
+  padding-block: 5px;
+}
+.brand {
+  min-height: 44px;
+}
+/* Überlange Wörter (z. B. „AMS-Weiterbildungszeit“) dürfen bei großer Schrift umbrechen. */
+main,
+#dialog-content {
+  overflow-wrap: break-word;
+}
+/* Programmatischer Fokus auf Überschriften und Inhalt (für Screenreader) braucht keinen Rahmen. */
+h1[tabindex="-1"]:focus,
+h2[tabindex="-1"]:focus,
+main[tabindex="-1"]:focus {
+  outline: none;
 }

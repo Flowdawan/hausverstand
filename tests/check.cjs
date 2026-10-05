@@ -66,6 +66,8 @@ for (const p of PHASES) for (const m of p.modules) check(COURSE.some(c => c.id =
 const inPhases = new Set(PHASES.flatMap(p => p.modules));
 for (const c of COURSE) check(inPhases.has(c.id), `Modul ${c.id} ist keiner Phase zugeordnet`);
 for (const [k, v] of Object.entries(TERMS)) check(v.length > 10, `Begriff ${k} ohne Erklärung`);
+const versions = [...fs.readFileSync(path.join(root, 'index.html'), 'utf8').matchAll(/\?v=([\w.-]+)/g)].map(m => m[1]);
+check(versions.length === 3 && new Set(versions).size === 1, `index.html: Versionsangaben ?v= müssen gleich sein (${versions.join(', ')})`);
 const units = COURSE.reduce((a, c) => a + c.steps.length, 0);
 console.log(`Inhalt: ${COURSE.length} Module, ${units} Aufgaben, ${Object.keys(TERMS).length} Begriffe; richtige Antwort ist bei ${Math.round(ratio * 100)} % der Auswahlfragen die längste.`);
 
@@ -231,7 +233,75 @@ async function browserTests() {
     const file = await download.path();
     await page.evaluate(() => { localStorage.removeItem('hausverstand-wien-v3'); });
     await page.setInputFiles('#import-file', file);
-    await page.waitForFunction(() => /Lernstand geladen/.test(document.getElementById('import-status').textContent));
+    await page.waitForFunction(() => /zusammengeführt/.test(document.getElementById('import-status').textContent));
+    await context.close();
+  }
+
+  // 5b) Befunde aus dem Review: Sprunglink, Wiederholung im Hash, Fokus nach Menü, Weiterlernen, mehrere Tabs, Import.
+  {
+    const {context, page} = await newPage();
+    await page.goto(base + '#learn/base-01/1/learn');
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Enter');
+    check(await page.locator('[data-action="quiz"]').count() === 1 && /#learn\/base-01\/1/.test(page.url()), 'Sprunglink verlässt die Lektion');
+    check(await page.evaluate(() => document.activeElement.id === 'main'), 'Sprunglink setzt den Fokus nicht auf den Inhalt');
+    // Weiterlernen nach beantworteter Aufgabe öffnet die nächste Aufgabe.
+    await page.click('[data-action="quiz"]');
+    await answerCorrectly(page, 'base-01', 1);
+    await page.goto(base + '#home');
+    await page.click('[data-action="resume"]');
+    check(/#learn\/base-01\/2\/learn/.test(page.url()), `Weiterlernen öffnet nicht die nächste Aufgabe (${page.url()})`);
+    // Wiederholung übersteht Neuladen.
+    await page.goto(base + '#learn/base-02/0/quiz');
+    const wrong = await page.evaluate(() => COURSE.find(c => c.id === 'base-02').steps[0].options.findIndex(o => o[1] !== true));
+    await page.click(`[data-action="answer"][data-answer="${wrong}"]`);
+    await page.goto(base + '#home');
+    await page.click('[data-action="review"]');
+    await page.reload();
+    check(/Wiederholung 1 von 1/.test(await page.textContent('.fraction')), 'Wiederholungsmodus geht beim Neuladen verloren');
+    // Fokus nach Menüaktion
+    await page.click('#menu');
+    await page.click('[data-modal="home"]');
+    await page.waitForTimeout(100);
+    check(await page.evaluate(() => document.activeElement.tagName === 'H1'), 'Fokus nach „Zum Lernweg“ nicht auf der Überschrift');
+    // Zweiter Tab darf Fortschritt nicht überschreiben.
+    const pageB = await context.newPage();
+    await pageB.goto(base + '#home');
+    for (const i of [0, 1, 2]) { await page.goto(base + `#learn/base-03/${i}/quiz`); await answerCorrectly(page, 'base-03', i); }
+    await pageB.click('[data-action="resume"]');
+    const kept = await page.evaluate(() => ['base-03:0', 'base-03:1', 'base-03:2'].every(id => JSON.parse(localStorage.getItem('hausverstand-wien-v3')).progress[id]?.seen));
+    check(kept, 'Zweiter Tab überschreibt Fortschritt');
+    // Import führt zusammen und lehnt Unsinn ab.
+    await page.goto(base + '#home');
+    const before = await page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('hausverstand-wien-v3')).progress).length);
+    const bad = path.join(require('os').tmpdir(), 'hv-bad.json'), small = path.join(require('os').tmpdir(), 'hv-small.json');
+    fs.writeFileSync(bad, JSON.stringify({version: 2, progress: {'base-01:0': {seen: 'true'}}}));
+    fs.writeFileSync(small, JSON.stringify({version: 2, progress: {'owner-team:0': {seen: true, correct: true}}}));
+    await page.click('#menu'); await page.click('[data-modal="progress"]');
+    await page.setInputFiles('#import-file', bad);
+    await page.waitForFunction(() => /kein passender/.test(document.getElementById('import-status').textContent));
+    await page.setInputFiles('#import-file', small);
+    await page.waitForFunction(() => /zusammengeführt/.test(document.getElementById('import-status').textContent));
+    const after = await page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('hausverstand-wien-v3')).progress).length);
+    check(after === before + 1, `Import überschreibt statt zusammenzuführen (${before} → ${after})`);
+    // Zurücksetzen löscht alles, auch alte Formate.
+    await page.click('[data-modal="reset"]'); await page.click('[data-modal="confirm-reset"]');
+    const cleared = await page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('hausverstand-wien-v3')).progress).length === 0 && !localStorage.getItem('hausverstand-wien-v2'));
+    check(cleared, 'Zurücksetzen löscht nicht alles');
+    await context.close();
+  }
+  // 5c) Altes v2-Fenster speichert nach der Umstellung weiter: Einträge werden nachgeholt.
+  {
+    const {context, page} = await newPage();
+    await page.goto(base);
+    await page.evaluate(() => {
+      localStorage.clear();
+      localStorage.setItem('hausverstand-wien-v3', JSON.stringify({version: 3, contentRev: CONTENT_REV, progress: {'base-01:0': {seen: true, correct: true, at: 5}}}));
+      localStorage.setItem('hausverstand-wien-v2', JSON.stringify({version: 2, progress: {'base-01:0': {seen: true, correct: false, needsReview: true}, 'base-01:1': {seen: true, correct: true}}}));
+    });
+    await page.reload();
+    const s2 = await page.evaluate(() => JSON.parse(localStorage.getItem('hausverstand-wien-v3')).progress);
+    check(s2['base-01:1']?.seen && s2['base-01:0'].correct === true, 'Einträge aus altem v2-Fenster nicht korrekt nachgeholt');
     await context.close();
   }
 
@@ -244,8 +314,22 @@ async function browserTests() {
     const label = `${w}px/Schrift ${font}`;
     await noOverflow(page, `${label} Start`);
     if (shots) await page.screenshot({path: path.join(shots, `m${w}-f${font}-home.png`), fullPage: true});
-    await page.click('[data-category="ownership"]');
-    await noOverflow(page, `${label} Kategorie`);
+    for (const cat of ['basics', 'office', 'courses', 'ownership']) {
+      for (let pg = 0; pg < 5; pg++) {
+        await page.goto(base + `#category/${cat}/${pg}`);
+        await noOverflow(page, `${label} Kategorie ${cat}/${pg}`);
+      }
+    }
+    for (const dlg of ['courses', 'sources', 'progress']) {
+      await page.goto(base + '#home');
+      await page.click('#menu'); await page.click(`[data-modal="${dlg}"]`);
+      await noOverflow(page, `${label} Dialog ${dlg}`);
+      if (shots) await page.screenshot({path: path.join(shots, `m${w}-f${font}-dialog-${dlg}.png`)});
+      await page.keyboard.press('Escape');
+    }
+    await page.click('#words');
+    await noOverflow(page, `${label} Dialog Wörter`);
+    await page.keyboard.press('Escape');
     for (const target of ['#learn/office-meeting/0/quiz', '#learn/course-modules/0/quiz', '#learn/base-weg/0/quiz', '#learn/owner-gf/1/learn', '#learn/course-exam/0/quiz', '#path']) {
       await page.goto(base + target);
       await noOverflow(page, `${label} ${target}`);
